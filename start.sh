@@ -168,6 +168,28 @@ install_requirements() {
 
 install_requirements
 
+# ── Build tracker list ───────────────────────────────────────────────────────
+TRACKERS="udp://tracker.opentrackr.org:1337/announce"
+TRACKERS="$TRACKERS,udp://tracker.openbittorrent.com:6969/announce"
+TRACKERS="$TRACKERS,http://tracker.openbittorrent.com:80/announce"
+TRACKERS="$TRACKERS,udp://tracker.torrent.eu.org:451/announce"
+TRACKERS="$TRACKERS,udp://exodus.desync.com:6969/announce"
+TRACKERS="$TRACKERS,udp://tracker.cyberia.is:6969/announce"
+TRACKERS="$TRACKERS,udp://open.demonii.com:1337/announce"
+TRACKERS="$TRACKERS,udp://9.rarbg.com:2810/announce"
+TRACKERS="$TRACKERS,udp://tracker.moeking.me:6969/announce"
+TRACKERS="$TRACKERS,udp://tracker.lelux.fi:6969/announce"
+TRACKERS="$TRACKERS,udp://retracker.lanta-net.ru:2710/announce"
+TRACKERS="$TRACKERS,udp://opentor.net:2710/announce"
+TRACKERS="$TRACKERS,udp://tracker.dler.org:6969/announce"
+TRACKERS="$TRACKERS,udp://tracker.tiny-vps.com:6969/announce"
+TRACKERS="$TRACKERS,https://tracker.tamersunion.org:443/announce"
+TRACKERS="$TRACKERS,https://tracker.loligirl.cn:443/announce"
+TRACKERS="$TRACKERS,udp://tracker.theoks.net:6969/announce"
+TRACKERS="$TRACKERS,udp://tracker1.bt.moack.co.kr:80/announce"
+TRACKERS="$TRACKERS,udp://open.stealth.si:80/announce"
+TRACKERS="$TRACKERS,udp://tracker.zemoj.com:6969/announce"
+
 # ── Start Aria2c RPC ─────────────────────────────────────────────────────────
 echo "🚀 Starting Aria2c RPC daemon..."
 
@@ -183,21 +205,56 @@ aria2c \
     --rpc-listen-port="$RPC_PORT" \
     --rpc-secret="$ARIA2_SECRET" \
     --rpc-max-request-size=16M \
+    --dir=/tmp/downloads \
+    \
+    `# ── General Download ────────────────────────────────` \
     --max-concurrent-downloads=5 \
     --max-connection-per-server=16 \
-    --min-split-size=10M \
+    --min-split-size=1M \
     --split=16 \
     --continue=true \
     --auto-file-renaming=false \
     --allow-overwrite=true \
     --disk-cache=64M \
     --file-allocation=none \
+    --max-overall-download-limit=0 \
+    --max-overall-upload-limit=1K \
+    \
+    `# ── Torrent / Magnet ────────────────────────────────` \
+    --enable-dht=true \
+    --enable-dht6=true \
+    --dht-listen-port=6881-6889 \
+    --enable-peer-exchange=true \
+    --bt-enable-lpd=true \
+    --bt-max-peers=200 \
+    --bt-request-peer-speed-limit=50M \
+    --bt-save-metadata=true \
+    --bt-seed-unverified=true \
+    --bt-prioritize-piece=head=2M,tail=2M \
+    --bt-remove-unselected-file=true \
+    --seed-time=0 \
+    --follow-torrent=true \
+    --bt-tracker="$TRACKERS" \
+    \
+    `# ── Logging ─────────────────────────────────────────` \
     --log-level=warn \
     --daemon=true \
-    --dir=/tmp/downloads 2>/dev/null || true
+    2>/dev/null || true
 
 echo "⏳ Waiting for RPC on port $RPC_PORT..."
 sleep 3
+
+# ── Verify RPC is up ─────────────────────────────────────────────────────────
+if command_exists curl; then
+    ARIA2_STATUS=$(curl -s --max-time 3 \
+        -d '{"jsonrpc":"2.0","id":"check","method":"aria2.getVersion","params":["token:'"$ARIA2_SECRET"'"]}' \
+        http://localhost:"$RPC_PORT"/jsonrpc 2>/dev/null | grep -o '"version"' || true)
+    if [ -n "$ARIA2_STATUS" ]; then
+        echo "✅ Aria2c RPC is live on port $RPC_PORT"
+    else
+        echo "⚠️  Aria2c RPC check inconclusive — proceeding anyway"
+    fi
+fi
 
 # ── Start Bot ────────────────────────────────────────────────────────────────
 echo "🤖 Starting Leech Bot..."
