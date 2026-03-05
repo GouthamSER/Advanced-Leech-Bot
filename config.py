@@ -16,9 +16,6 @@ ARIA2_HOST   = os.environ.get("ARIA2_HOST", "http://localhost")
 ARIA2_PORT   = int(os.environ.get("ARIA2_PORT", "6800"))
 ARIA2_SECRET = os.environ.get("ARIA2_SECRET", "gjxml")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Paths
-# ─────────────────────────────────────────────────────────────────────────────
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/tmp/downloads")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -29,9 +26,8 @@ OWNER_PREMIUM    = os.environ.get("OWNER_PREMIUM", "false").lower() == "true"
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024 if OWNER_PREMIUM else 2 * 1024 * 1024 * 1024
 MAX_UPLOAD_LABEL = "4GB" if OWNER_PREMIUM else "2GB"
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Web Server (keep-alive for Render / Koyeb / Railway)
-# ─────────────────────────────────────────────────────────────────────────────
+TASKS_PER_PAGE = int(os.environ.get("TASKS_PER_PAGE", "4"))
+
 PORT = int(os.environ.get("PORT", "8000"))
 
 # ─────────────────────────────────────────────────────────────────────────────
