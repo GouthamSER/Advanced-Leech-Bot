@@ -327,7 +327,7 @@ async def push_dashboard_update(user_id: int):
 
 async def dashboard_loop(user_id: int):
     while True:
-        await asyncio.sleep(DASHBOARD_REFRESH_INTERVAL)
+        await asyncio.sleep(10)   # auto-refresh every 10s
         dash = user_dashboards.get(user_id)
         if not dash: break
         user_tasks = [t for t in active_downloads.values() if t.user_id == user_id]
@@ -401,7 +401,7 @@ async def dashboard_refresh_callback(client, cq: CallbackQuery):
         await cq.answer(f"❌ {e}", show_alert=True)
 
 
-# ── Callback: Page navigation ─────────────────────────────────────────────────
+# ── Callback: Page navigation (NO rate limit — instant switch) ────────────────
 @app.on_callback_query(filters.regex(r"^dpage:"))
 async def dashboard_page_callback(client, cq: CallbackQuery):
     parts    = cq.data.split(":")      # ["dpage", uid, page]
@@ -417,24 +417,16 @@ async def dashboard_page_callback(client, cq: CallbackQuery):
     if new_page == dash.get("page", 0):
         await cq.answer(); return     # already on this page
 
-    now = time.time()
-    if now < dash.get("flood_until", 0):
-        left = int(dash["flood_until"] - now)
-        await cq.answer(f"⏳ Rate limit — resumes in {left}s", show_alert=True); return
-    if now - dash.get("last_edit_at", 0) < MIN_EDIT_GAP:
-        gap = int(MIN_EDIT_GAP - (now - dash.get("last_edit_at", 0)))
-        await cq.answer(f"⏳ Please wait {gap}s.", show_alert=True); return
-
     dash["page"] = new_page
     text = build_dashboard_text(user_id, dash.get("user_label", f"#ID{user_id}"), new_page)
     kb   = dashboard_keyboard(user_id, new_page, total_pages)
     try:
         await cq.edit_message_text(text, reply_markup=kb)
         dash["last_text"] = text; dash["last_edit_at"] = time.time()
-        await cq.answer(f"📄 Page {new_page + 1} / {total_pages}")
+        await cq.answer()
     except FloodWait as e:
         ws = e.value + 3; dash["flood_until"] = time.time() + ws
-        await cq.answer(f"⚠️ Rate limit ({e.value}s).", show_alert=True)
+        await cq.answer()
     except MessageNotModified:
         await cq.answer()
     except Exception as e:
