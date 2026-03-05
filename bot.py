@@ -6,7 +6,7 @@ import aria2p
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.errors import FloodWait, MessageNotModified, QueryIdInvalid
 import py7zr
 import zipfile
 import shutil
@@ -99,12 +99,31 @@ def get_system_stats() -> dict:
     up   = time.time() - psutil.boot_time()
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     disk = psutil.disk_usage(DOWNLOAD_DIR)
-    return {"cpu":cpu,"ram_percent":ram.percent,"uptime":format_time(up),"disk_free":disk.free/(1024**3),"disk_free_pct":100.0-disk.percent}
+    dl_speed = ul_speed = 0
+    try:
+        gs = aria2.get_global_stat()
+        dl_speed = int(getattr(gs, "download_speed", 0) or 0)
+        ul_speed = int(getattr(gs, "upload_speed", 0) or 0)
+    except Exception:
+        pass
+    return {
+        "cpu":           cpu,
+        "ram_percent":   ram.percent,
+        "uptime":        format_time(up),
+        "disk_free":     disk.free / (1024**3),
+        "disk_free_pct": 100.0 - disk.percent,
+        "dl_speed":      dl_speed,
+        "ul_speed":      ul_speed,
+    }
 
-def bot_stats_block(st: dict) -> str:
-    return (f"© **Bot Stats**\n"
-            f"├ **CPU** → {st['cpu']:.1f}% | **F** → {st['disk_free']:.2f}GB [{st['disk_free_pct']:.1f}%]\n"
-            f"└ **RAM** → {st['ram_percent']:.1f}% | **UP** → {st['uptime']}")
+def bot_stats_block(st: dict, task_count: int = 0) -> str:
+    return (
+        f"⌬ **Bot Stats**\n"
+        f"┠ **Tasks:** {task_count}\n"
+        f"┠ **CPU:** {st['cpu']:.1f}% | **F:** {st['disk_free']:.2f}GB [{st['disk_free_pct']:.1f}%]\n"
+        f"┠ **RAM:** {st['ram_percent']:.1f}% | **UPTIME:** {st['uptime']}\n"
+        f"┖ **DL:** {format_speed(st['dl_speed'])} | **UL:** {format_speed(st['ul_speed'])}"
+    )
 
 def get_user_label(message: Message) -> str:
     try:
@@ -231,7 +250,7 @@ def build_dashboard_text(user_id: int, user_label: str, page: int = 0) -> str:
     page_label = f"  •  Page {page + 1} / {total_pages}" if total_pages > 1 else ""
     return (f"**Task By** {user_label} — {' | '.join(parts)}{page_label}\n\n"
             f"{body}\n\n"
-            f"{bot_stats_block(stats)}")
+            f"{bot_stats_block(stats, len(tasks))}")
 
 
 def dashboard_keyboard(user_id: int, page: int = 0, total_pages: int = 1) -> InlineKeyboardMarkup:
@@ -320,10 +339,8 @@ async def _enqueue_edit(user_id: int):
     except asyncio.QueueFull:
         pass
 
-
 async def push_dashboard_update(user_id: int):
     await _enqueue_edit(user_id)
-
 
 async def dashboard_loop(user_id: int):
     while True:
@@ -349,7 +366,6 @@ async def dashboard_loop(user_id: int):
         if now - dash.get("last_edit_at", 0) < MIN_EDIT_GAP: continue
         await _enqueue_edit(user_id)
 
-
 async def get_or_create_dashboard(user_id: int, trigger_msg: Message, user_label: str) -> Message:
     dash = user_dashboards.get(user_id)
     if dash:
@@ -367,6 +383,12 @@ async def get_or_create_dashboard(user_id: int, trigger_msg: Message, user_label
     asyncio.create_task(dashboard_loop(user_id))
     return msg
 
+async def safe_answer(cq, text: str = "", show_alert: bool = False):
+    """Answer a callback query, silently ignoring expired query ID errors."""
+    try:
+        await cq.answer(text, show_alert=show_alert)
+    except (QueryIdInvalid, Exception):
+        pass
 
 # ── Callback: Refresh ─────────────────────────────────────────────────────────
 @app.on_callback_query(filters.regex(r"^dash:"))
@@ -375,14 +397,14 @@ async def dashboard_refresh_callback(client, cq: CallbackQuery):
     user_id = int(uid)
     dash = user_dashboards.get(user_id)
     if not dash:
-        await cq.answer("⚠️ No active tasks.", show_alert=True); return
+        await safe_answer(cq, "⚠️ No active tasks.", show_alert=True); return
     now = time.time()
     if now < dash.get("flood_until", 0):
         left = int(dash["flood_until"] - now)
-        await cq.answer(f"⏳ Rate limit active — auto-refresh resumes in {left}s", show_alert=True); return
+        await safe_answer(cq, f"⏳ Rate limit active — auto-refresh resumes in {left}s", show_alert=True); return
     if now - dash.get("last_edit_at", 0) < MIN_EDIT_GAP:
         gap = int(MIN_EDIT_GAP - (now - dash.get("last_edit_at", 0)))
-        await cq.answer(f"⏳ Please wait {gap}s between refreshes.", show_alert=True); return
+        await safe_answer(cq, f"⏳ Please wait {gap}s between refreshes.", show_alert=True); return
 
     page        = dash.get("page", 0)
     total_pages = get_total_pages(user_id)
@@ -391,15 +413,14 @@ async def dashboard_refresh_callback(client, cq: CallbackQuery):
     try:
         await cq.edit_message_text(text, reply_markup=kb)
         dash["last_text"] = text; dash["last_edit_at"] = time.time()
-        await cq.answer("")
+        await safe_answer(cq, "✅ Refreshed!")
     except FloodWait as e:
         ws = e.value + 3; dash["flood_until"] = time.time() + ws
-        await cq.answer(f"⚠️ Rate limit ({e.value}s). Auto-refresh will continue.", show_alert=True)
+        await safe_answer(cq, f"⚠️ Rate limit ({e.value}s). Auto-refresh will continue.", show_alert=True)
     except MessageNotModified:
-        await cq.answer("ℹ️ Already up to date.")
+        await safe_answer(cq, "ℹ️ Already up to date.")
     except Exception as e:
-        await cq.answer(f"❌ {e}", show_alert=True)
-
+        await safe_answer(cq, f"❌ {e}", show_alert=True)
 
 # ── Callback: Page navigation (NO rate limit — instant switch) ────────────────
 @app.on_callback_query(filters.regex(r"^dpage:"))
@@ -409,13 +430,13 @@ async def dashboard_page_callback(client, cq: CallbackQuery):
     new_page = int(parts[2])
     dash = user_dashboards.get(user_id)
     if not dash:
-        await cq.answer("⚠️ No active tasks.", show_alert=True); return
+        await safe_answer(cq, "⚠️ No active tasks.", show_alert=True); return
 
     total_pages = get_total_pages(user_id)
     new_page    = max(0, min(new_page, total_pages - 1))
 
     if new_page == dash.get("page", 0):
-        await cq.answer(); return     # already on this page
+        await safe_answer(cq); return     # already on this page
 
     dash["page"] = new_page
     text = build_dashboard_text(user_id, dash.get("user_label", f"#ID{user_id}"), new_page)
@@ -423,21 +444,19 @@ async def dashboard_page_callback(client, cq: CallbackQuery):
     try:
         await cq.edit_message_text(text, reply_markup=kb)
         dash["last_text"] = text; dash["last_edit_at"] = time.time()
-        await cq.answer()
+        await safe_answer(cq)
     except FloodWait as e:
         ws = e.value + 3; dash["flood_until"] = time.time() + ws
-        await cq.answer()
+        await safe_answer(cq)
     except MessageNotModified:
-        await cq.answer()
+        await safe_answer(cq)
     except Exception as e:
-        await cq.answer(f"❌ {e}", show_alert=True)
-
+        await safe_answer(cq, f"❌ {e}", show_alert=True)
 
 # ── Callback: no-op (page label button — tapping shows nothing) ───────────────
 @app.on_callback_query(filters.regex(r"^noop$"))
 async def noop_callback(client, cq: CallbackQuery):
-    await cq.answer()
-
+    await safe_answer(cq)
 
 # ── Download progress poller ──────────────────────────────────────────────────
 async def poll_download_progress(task: DownloadTask):
@@ -813,7 +832,7 @@ async def settings_command(client, message: Message):
 async def toggle_mode_callback(client, cq: CallbackQuery):
     _, uid_str = cq.data.split(":"); uid = int(uid_str)
     if cq.from_user.id != uid:
-        await cq.answer("❌ These aren't your settings!", show_alert=True); return
+        await safe_answer(cq, "❌ These aren't your settings!", show_alert=True); return
     cur = user_settings.get(uid, {}).get("as_video", False)
     user_settings.setdefault(uid, {})["as_video"] = not cur
     mt = "🎬 Video (Playable)" if not cur else "📄 Document (File)"
@@ -822,7 +841,7 @@ async def toggle_mode_callback(client, cq: CallbackQuery):
         [InlineKeyboardButton("🗑 Close", callback_data="close_help")]
     ])
     await cq.edit_message_reply_markup(reply_markup=kb)
-    await cq.answer(f"✅ Switched to {mt}!")
+    await safe_answer(cq, f"✅ Switched to {mt}!")
 
 
 # ── Keep-alive web server ─────────────────────────────────────────────────────
