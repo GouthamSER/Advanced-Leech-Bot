@@ -66,8 +66,10 @@ def clean_filename(filename: str) -> str:
     c = re.sub(r'^\[.*?\]\s*|^\(.*?\)\s*', '', filename)
     # remove @username
     c = re.sub(r'^@\w+\s*', '', c)
-    # remove only URL prefix but keep filename
+    # remove full URL with path (https://domain.com/path/to/)
     c = re.sub(r'^(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s]*/', '', c, flags=re.IGNORECASE)
+    # remove www.domain.tld_-_ or domain.tld_ prefix (no slash, uses _-_ separator)
+    c = re.sub(r'^(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,6}(?:\.[a-zA-Z]{2,6})?(?:_-_|_)', '', c, flags=re.IGNORECASE)
     c = c.strip() if c.strip() else filename
     if len(c) > 100:
         name, ext = os.path.splitext(c)
