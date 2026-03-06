@@ -599,7 +599,6 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
                 await message.reply_text(f"❌ File too large (>{MAX_UPLOAD_LABEL})")
                 return False
 
-            # ── STOP CHECK before upload starts ──
             if task and task.cancelled:
                 return False
 
@@ -629,8 +628,12 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
             else:
                 await message.reply_document(document=file_path, caption=fc, progress=_progress, disable_notification=True)
 
-            # ── If cancelled mid-upload, delete the sent message (best effort) ──
-            # (Pyrogram doesn't support cancelling an in-flight upload, so we just skip post-processing)
+            # ── Delete file immediately after upload ──
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"Immediate cleanup error (single file): {e}")
+
             return True
 
         elif os.path.isdir(file_path):
@@ -644,7 +647,6 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
             dir_start = time.time()
             for idx, fp in enumerate(files, 1):
 
-                # ── STOP CHECK before each file in multi-file upload ──
                 if task and task.cancelled:
                     return False
 
@@ -667,13 +669,26 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
                     await message.reply_video(video=fp, caption=cap, disable_notification=True)
                 else:
                     await message.reply_document(document=fp, caption=cap, disable_notification=True)
+
+                # ── Delete each file immediately after it's sent ──
+                try:
+                    os.remove(fp)
+                except Exception as e:
+                    print(f"Immediate cleanup error (file {idx}/{n}): {e}")
+
                 uploaded_bytes += file_sz
+
+            # ── Remove now-empty extracted directory ──
+            try:
+                shutil.rmtree(file_path, ignore_errors=True)
+            except Exception as e:
+                print(f"Immediate cleanup error (dir): {e}")
+
             return True
 
     except Exception as e:
         await message.reply_text(f"❌ Upload error: {str(e)}")
-        return False
-        
+        return False        
 # ── Core task processor ───────────────────────────────────────────────────────
 async def process_task_execution(message: Message, task: DownloadTask, download, extract: bool):
     gid = download.gid; task.gid = gid
