@@ -62,21 +62,25 @@ class DownloadTask:
 
 # ── Utility helpers ───────────────────────────────────────────────────────────
 def clean_filename(filename: str) -> str:
+    c = filename
     # remove [tag] or (tag) at start
-    c = re.sub(r'^\[.*?\]\s*|^\(.*?\)\s*', '', filename)
+    c = re.sub(r'^\[.*?\]\s*|^\(.*?\)\s*', '', c)
     # remove @username
     c = re.sub(r'^@\w+\s*', '', c)
-    # remove full URL with path (https://domain.com/path/to/)
-    c = re.sub(r'^(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s]*/', '', c, flags=re.IGNORECASE)
-    # remove www.domain.tld_-_ or domain.tld_ prefix (no slash, uses _-_ separator)
-    c = re.sub(r'^(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,6}(?:\.[a-zA-Z]{2,6})?(?:_-_|_)', '', c, flags=re.IGNORECASE)
-    c = c.strip() if c.strip() else filename
-    if len(c) > 100:
+    c = re.sub(r'https?://\S+', '', c)
+    c = re.sub(r'^(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:[._\-\s]+)', '', c, flags=re.IGNORECASE)
+    # remove leftover domain patterns anywhere in name
+    c = re.sub(r'(?:www\.)?[a-zA-Z0-9-]+\.(?:com|net|org|info|xyz|site|club)', '', c, flags=re.IGNORECASE)
+    c = c.strip(" .-_")
+    if not c:
+        c = filename
+    # limit length
+    if len(c) > 120:
         name, ext = os.path.splitext(c)
-        sl = 100 - len(ext) - 3
-        c = (name[:sl] + "..." + ext) if sl > 0 else c[:100]
+        sl = 120 - len(ext) - 3
+        c = (name[:sl] + "..." + ext) if sl > 0 else c[:120]
     return c
-
+    
 def create_progress_bar(pct: float) -> str:
     if pct >= 100: return "[" + chr(11042)*12 + "] 100%"
     f = int(pct / 100 * 12)
