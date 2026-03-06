@@ -239,7 +239,7 @@ def build_dashboard_text(user_id: int, user_label: str, page: int = 0) -> str:
     stats  = get_system_stats()
     stats["dl_speed"] = sum(t.dl["speed"] for t in tasks if t.current_phase == "dl")
     stats["ul_speed"] = sum(t.ul["speed"] for t in tasks if t.current_phase == "ul")
-    div    = "\n"
+    div    = "\n\n"
     # Global index so task numbers are continuous across pages (1-based)
     blocks = [build_task_block(t, start + i) for i, t in enumerate(page_tasks, 1)]
     body   = div.join(blocks)
