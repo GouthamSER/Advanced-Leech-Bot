@@ -62,14 +62,17 @@ class DownloadTask:
 
 # ── Utility helpers ───────────────────────────────────────────────────────────
 def clean_filename(filename: str) -> str:
+    # remove [tag] or (tag) at start
     c = re.sub(r'^\[.*?\]\s*|^\(.*?\)\s*', '', filename)
+    # remove @username
     c = re.sub(r'^@\w+\s*', '', c)
-    c = re.sub(r'^(?:(?:https?://)?(?:www\.)?[a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:/[^\s]*)?\s*[-–_]*\s*)', '', c, flags=re.IGNORECASE)
+    # remove only URL prefix but keep filename
+    c = re.sub(r'^(?:https?://)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^\s]*/', '', c, flags=re.IGNORECASE)
     c = c.strip() if c.strip() else filename
     if len(c) > 100:
         name, ext = os.path.splitext(c)
         sl = 100 - len(ext) - 3
-        c  = (name[:sl] + "..." + ext) if sl > 0 else c[:100]
+        c = (name[:sl] + "..." + ext) if sl > 0 else c[:100]
     return c
 
 def create_progress_bar(pct: float) -> str:
