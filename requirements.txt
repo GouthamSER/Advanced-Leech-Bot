@@ -5,6 +5,6 @@ aiohttp
 py7zr
 psutil
 uvloop
-git+https://github.com/yt-dlp/yt-dlp.git
+yt-dlp
 curl-cffi
 ffmpeg
