@@ -7,3 +7,4 @@ psutil
 uvloop
 git+https://github.com/yt-dlp/yt-dlp.git
 curl-cffi
+ffmpeg
