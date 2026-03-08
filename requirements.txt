@@ -1,7 +1,9 @@
-pyrofork
+pyrotgfork
 TgCrypto
 aria2p
 aiohttp
 py7zr
 psutil
 uvloop
+git+https://github.com/yt-dlp/yt-dlp.git
+curl-cffi
