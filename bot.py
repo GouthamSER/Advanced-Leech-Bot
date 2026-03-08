@@ -813,7 +813,7 @@ async def download_ytdl(url: str, task: DownloadTask, format_id: str) -> str:
         "outtmpl":            os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "quiet":              True,
         "nocheckcertificate": True,
-        "cookiefile":         "cookies.txt" if os.path.exists("cookies.txt") else None,
+        "cookiefile": os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt") if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")) else None,
         "noplaylist":         True,
         "progress_hooks":     [ytdl_progress],
     }
