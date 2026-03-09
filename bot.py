@@ -3,7 +3,6 @@ import re
 import time
 import asyncio
 import aria2p
-import yt_dlp
 from aiohttp import web
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -13,6 +12,7 @@ import zipfile
 import shutil
 import psutil
 from concurrent.futures import ThreadPoolExecutor
+from motor.motor_asyncio import AsyncIOMotorClient
 
 from config import (
     API_ID, API_HASH, BOT_TOKEN, OWNER_ID,
@@ -21,7 +21,8 @@ from config import (
     PORT, ENGINE_DL, ENGINE_UL, ENGINE_EXTRACT,
     DASHBOARD_REFRESH_INTERVAL, MIN_EDIT_GAP,
     WORKERS, MAX_CONCURRENT_TRANSMISSIONS,
-    BT_OPTIONS, DIRECT_OPTIONS, TASKS_PER_PAGE
+    BT_OPTIONS, DIRECT_OPTIONS, TASKS_PER_PAGE,
+    MONGO_URL # Make sure to add this to your config.py
 )
 
 try:
@@ -39,12 +40,15 @@ app = Client(
 aria2    = aria2p.API(aria2p.Client(host=ARIA2_HOST, port=ARIA2_PORT, secret=ARIA2_SECRET))
 executor = ThreadPoolExecutor(max_workers=4)
 
+# MongoDB Setup
+mongo_client = AsyncIOMotorClient(MONGO_URL)
+db = mongo_client["leech_bot_db"]
+users_col = db["users"]
+
 active_downloads = {}
 user_settings    = {}
 user_dashboards  = {}
 user_edit_queues = {}
-ytdl_session     = {}
-
 
 class DownloadTask:
     def __init__(self, gid: str, user_id: int, extract: bool = False):
@@ -611,6 +615,10 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
     as_video   = user_settings.get(user_id, {}).get("as_video", False)
     video_exts = (".mp4", ".mkv", ".avi", ".webm")
 
+    # Fetch User's Dump Channel
+    user_data = await users_col.find_one({"user_id": user_id})
+    dump_channel = user_data.get("dump_channel") if user_data else None
+
     try:
         if os.path.isfile(file_path):
             fs = os.path.getsize(file_path)
@@ -643,10 +651,20 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
                     await push_dashboard_update(user_id)
 
             fc = caption or cn
+            
+            # Send the file and store the message object
+            sent_msg = None
             if as_video and file_path.lower().endswith(video_exts):
-                await message.reply_video(video=file_path, caption=fc, progress=_progress, supports_streaming=True, disable_notification=True)
+                sent_msg = await message.reply_video(video=file_path, caption=fc, progress=_progress, supports_streaming=True, disable_notification=True)
             else:
-                await message.reply_document(document=file_path, caption=fc, progress=_progress, disable_notification=True)
+                sent_msg = await message.reply_document(document=file_path, caption=fc, progress=_progress, disable_notification=True)
+
+            # Copy to Dump Channel if set
+            if sent_msg and dump_channel:
+                try:
+                    await sent_msg.copy(dump_channel)
+                except Exception as e:
+                    print(f"Failed to copy to dump channel {dump_channel}: {e}")
 
             try: os.remove(file_path)
             except Exception as e: print(f"Cleanup error (single): {e}")
@@ -690,10 +708,18 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
                     })
                     await push_dashboard_update(user_id)
 
+                sent_msg = None
                 if as_video and fp.lower().endswith(video_exts):
-                    await message.reply_video(video=fp, caption=cap, disable_notification=True)
+                    sent_msg = await message.reply_video(video=fp, caption=cap, disable_notification=True)
                 else:
-                    await message.reply_document(document=fp, caption=cap, disable_notification=True)
+                    sent_msg = await message.reply_document(document=fp, caption=cap, disable_notification=True)
+
+                # Copy to Dump Channel if set
+                if sent_msg and dump_channel:
+                    try:
+                        await sent_msg.copy(dump_channel)
+                    except Exception as e:
+                        print(f"Failed to copy file {idx} to dump channel: {e}")
 
                 try: os.remove(fp)
                 except Exception as e: print(f"Cleanup error (file {idx}/{n}): {e}")
@@ -775,164 +801,28 @@ async def process_task_execution(message: Message, task: DownloadTask, download,
 
 
 # ════════════════════════════════════════════════════════
-#  YT-DLP 
-# ════════════════════════════════════════════════════════
-
-async def download_ytdl(url: str, task: DownloadTask, format_id: str) -> str:
-    loop = asyncio.get_event_loop()
-    last_push = [0.0]
-
-    def ytdl_progress(d):
-        if d["status"] != "downloading": return
-        total    = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
-        current  = d.get("downloaded_bytes", 0)
-        filename = os.path.basename(d.get("filename", "Video"))
-        speed    = d.get("speed") or 0
-        eta_s    = d.get("eta") or 0
-        progress = (current / total * 100) if total > 0 else 0
-        elapsed  = time.time() - task.start_time
-        task.dl.update({
-            "filename":   clean_filename(filename),
-            "progress":   progress,
-            "speed":      speed,
-            "downloaded": current,
-            "total":      total,
-            "elapsed":    elapsed,
-            "eta":        eta_s,
-            "peer_line":  "├ **Engine** → YT-DLP\n",
-        })
-        task.filename  = clean_filename(filename)
-        task.file_size = total
-        now = time.time()
-        if current > 0 and now - last_push[0] >= MIN_EDIT_GAP:
-            last_push[0] = now
-            asyncio.run_coroutine_threadsafe(push_dashboard_update(task.user_id), loop)
-
-    cookie_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-    
-    # --- ANTI-BAN OPTIONS ADDED HERE ---
-    ydl_opts = {
-        "format":             format_id,
-        "outtmpl":            os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
-        "quiet":              True,
-        "nocheckcertificate": True,
-        "noplaylist":         True,
-        "progress_hooks":     [ytdl_progress],
-        "source_address":     "0.0.0.0", # Bypass some IP blocks
-        "extractor_args":     {"youtube": ["player_client=android,web"]}, # Fixes Data Sync ID Error
-    }
-    
-    if os.path.exists(cookie_path):
-        ydl_opts["cookiefile"] = cookie_path
-
-    def _run():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return str(ydl.prepare_filename(info))
-
-    raw_path = await loop.run_in_executor(executor, _run)
-    base, _ = os.path.splitext(raw_path)
-    for ext in (".mp4", ".mkv", ".webm", ".m4a", ".mp3", ".opus", ""):
-        candidate = base + ext
-        if os.path.exists(candidate):
-            return candidate
-    return raw_path
-
-
-async def process_ytdl_task(message: Message, task: DownloadTask, url: str, format_id: str):
-    try:
-        await push_dashboard_update(task.user_id)
-        file_path = await download_ytdl(url, task, format_id)
-        if task.cancelled:
-            cleanup_files(task); active_downloads.pop(task.gid, None)
-            await push_dashboard_update(task.user_id); return
-        task.file_path = file_path
-        await upload_to_telegram(file_path, message, task=task)
-        cleanup_files(task); active_downloads.pop(task.gid, None)
-        await push_dashboard_update(task.user_id)
-    except Exception as e:
-        await message.reply_text(f"❌ **YT-DLP Error:** `{str(e)}`")
-        cleanup_files(task); active_downloads.pop(task.gid, None)
-        await push_dashboard_update(task.user_id)
-
-
-@app.on_message(filters.command(["ytdl", "yt"]))
-async def ytdl_selector(client, m: Message):
-    if len(m.command) < 2: return await m.reply_text("❌ Send Link!")
-    url = m.text.split(None, 1)[1]
-    msg = await m.reply_text("🔍 **Fetching...**")
-    try:
-        loop = asyncio.get_event_loop()
-        def _run():
-            cookie_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-            
-            # --- ANTI-BAN OPTIONS ADDED HERE ---
-            ydl_opts = {
-                "quiet": True, 
-                "nocheckcertificate": True,
-                "source_address": "0.0.0.0", # Bypass some IP blocks
-                "extractor_args": {"youtube": ["player_client=android,web"]} # Fixes Data Sync ID Error
-            }
-            if os.path.exists(cookie_path):
-                ydl_opts["cookiefile"] = cookie_path
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
-                
-        info = await loop.run_in_executor(executor, _run)
-        formats = info.get("formats", [])
-        buttons = []
-        seen = set()
-        for f in formats:
-            h = f.get("height")
-            if h and h not in seen and f.get("ext") == "mp4":
-                buttons.append([InlineKeyboardButton(f"🎬 {h}p", callback_data=f"yt_vid|{h}|{m.id}")])
-                seen.add(h)
-        buttons.append([InlineKeyboardButton("🎵 MP3", callback_data=f"yt_aud|mp3|{m.id}")])
-        buttons.append([InlineKeyboardButton("✖️ Cancel", callback_data="close_help")])
-        ytdl_session[m.id] = {"url": url, "user_id": m.from_user.id, "message": m}
-        await msg.edit_text("**Select Quality:**", reply_markup=InlineKeyboardMarkup(buttons))
-    except Exception as e:
-        await msg.edit_text(f"❌ **Error Fetching Info:**\n`{str(e)}`")
-
-
-@app.on_callback_query(filters.regex(r"^yt_"))
-async def ytdl_cb(client, cq: CallbackQuery):
-    data = cq.data.split("|")
-    mode, quality, msg_id = data[0], data[1], int(data[2])
-    session = ytdl_session.get(msg_id)
-    if not session:
-        await safe_answer(cq, "❌ Expired", show_alert=True); return
-    await safe_answer(cq)
-
-    if mode == "yt_vid":
-        f_id  = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
-        label = f"{quality}p"
-    else:
-        f_id  = "bestaudio/best"
-        label = "MP3"
-
-    orig_msg   = session["message"]
-    user_id    = session["user_id"]
-    user_label = get_user_label(orig_msg)
-
-    await cq.message.edit_text(f"⏳ **Starting Download: {label}...**")
-
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-    await get_or_create_dashboard(user_id, orig_msg, user_label)
-
-    pseudo_gid = f"ytdl_{msg_id}_{int(time.time())}"
-    task = DownloadTask(pseudo_gid, user_id)
-    task.dl["peer_line"] = "├ **Engine** → YT-DLP\n"
-    active_downloads[pseudo_gid] = task
-
-    asyncio.create_task(process_ytdl_task(orig_msg, task, session["url"], f_id))
-    ytdl_session.pop(msg_id, None)
-
-
-# ════════════════════════════════════════════════════════
 #  BOT COMMANDS
 # ════════════════════════════════════════════════════════
+
+@app.on_message(filters.command(["setdump"]))
+async def set_dump_channel(client, message: Message):
+    if len(message.command) < 2:
+        return await message.reply_text("❌ **Usage:** `/setdump <channel_id>`\n*(Make sure the bot is an admin in the channel)*")
+    
+    try:
+        channel_id = int(message.command[1])
+        # Save to DB
+        await users_col.update_one(
+            {"user_id": message.from_user.id},
+            {"$set": {"dump_channel": channel_id}},
+            upsert=True
+        )
+        await message.reply_text(f"✅ **Dump Channel saved successfully!**\nFiles will now be copied to `{channel_id}`.")
+    except ValueError:
+        await message.reply_text("❌ **Invalid channel ID.** It must be an integer (e.g., `-100123456789`).")
+    except Exception as e:
+        await message.reply_text(f"❌ **Error:** `{str(e)}`")
+
 
 @app.on_message(filters.command(["leech", "l", "ql"]))
 async def universal_leech_command(client, message: Message):
@@ -1030,9 +920,8 @@ async def help_command(client, message: Message):
         "• `/ql <link1> <link2>` — Download multiple links at once\n"
         "• `/leech <link>` — Standard download\n"
         "• `/leech <link> -e` — Download & auto-extract archive\n"
-        "• **Upload a `.torrent` file** directly to start\n"
-        "• `/ytdl <URL>` — YouTube & 1000+ sites with quality picker\n"
-        "• `/yt <URL>` — Shorthand for /ytdl\n\n"
+        "• `/setdump <channel_id>` — Set your personal dump channel\n"
+        "• **Upload a `.torrent` file** directly to start\n\n"
         "**⚙️ Control:**\n"
         "• `/settings` — Toggle Document / Video upload mode\n"
         "• `/stop <task_id>` — Cancel an active task\n\n"
@@ -1041,8 +930,7 @@ async def help_command(client, message: Message):
         "✓ ONE dashboard message per user, auto-refreshes every 15s\n"
         "✓ FloodWait eliminated via serialised edit queue\n"
         "✓ 20 supercharged trackers + 200 max peers\n"
-        "✓ Smart filename cleaning\n"
-        "✓ cookies.txt support for age-restricted videos", reply_markup=kb)
+        "✓ Smart filename cleaning", reply_markup=kb)
 
 
 @app.on_callback_query(filters.regex(r"^close_help$"))
@@ -1103,7 +991,16 @@ async def main():
     print(f"⏱️  Min edit gap   : {MIN_EDIT_GAP}s")
     print(f"📄 Tasks per page  : {TASKS_PER_PAGE}")
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    
     await app.start()
+    
+    # Send restart message to OWNER PM
+    try:
+        await app.send_message(OWNER_ID, "✅ **Bot Restarted Successfully!**")
+        print(f"✅ Restart notification sent to Owner ({OWNER_ID})")
+    except Exception as e:
+        print(f"⚠️ Could not send restart notification to Owner: {e}")
+
     await start_web_server()
     print("🤖 Bot ready — listening for commands...")
     await idle()
