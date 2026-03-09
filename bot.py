@@ -775,7 +775,7 @@ async def process_task_execution(message: Message, task: DownloadTask, download,
 
 
 # ════════════════════════════════════════════════════════
-#  YT-DLP  —  taken from code 2, unchanged
+#  YT-DLP 
 # ════════════════════════════════════════════════════════
 
 async def download_ytdl(url: str, task: DownloadTask, format_id: str) -> str:
@@ -808,15 +808,18 @@ async def download_ytdl(url: str, task: DownloadTask, format_id: str) -> str:
             last_push[0] = now
             asyncio.run_coroutine_threadsafe(push_dashboard_update(task.user_id), loop)
 
+    cookie_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     ydl_opts = {
         "format":             format_id,
         "outtmpl":            os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "quiet":              True,
         "nocheckcertificate": True,
-        "cookiefile": os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt") if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")) else None,
         "noplaylist":         True,
         "progress_hooks":     [ytdl_progress],
     }
+    
+    if os.path.exists(cookie_path):
+        ydl_opts["cookiefile"] = cookie_path
 
     def _run():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -857,8 +860,14 @@ async def ytdl_selector(client, m: Message):
     try:
         loop = asyncio.get_event_loop()
         def _run():
-            with yt_dlp.YoutubeDL({"quiet": True, "nocheckcertificate": True}) as ydl:
+            cookie_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+            ydl_opts = {"quiet": True, "nocheckcertificate": True}
+            if os.path.exists(cookie_path):
+                ydl_opts["cookiefile"] = cookie_path
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
+                
         info = await loop.run_in_executor(executor, _run)
         formats = info.get("formats", [])
         buttons = []
