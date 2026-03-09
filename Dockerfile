@@ -16,6 +16,8 @@ RUN apt-get update -qq && \
         ca-certificates \
         netcat-openbsd \
         procps \
+        ffmpeg \
+        nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements file FIRST (this leverages Docker layer caching for faster rebuilds)
@@ -23,7 +25,8 @@ COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -U --pre yt-dlp
 
 # Copy the rest of the project files
 COPY . /app
