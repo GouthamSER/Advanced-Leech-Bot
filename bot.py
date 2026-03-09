@@ -1,4 +1,5 @@
 import os
+import yt_dlp
 import re
 import time
 import asyncio
@@ -481,6 +482,167 @@ async def dashboard_page_callback(client, cq: CallbackQuery):
         await safe_answer(cq)
     except Exception as e:
         await safe_answer(cq, f"❌ {e}", show_alert=True)
+
+async def download_ytdl(url: str, task: DownloadTask, format_id: str) -> str:
+    loop = asyncio.get_event_loop()
+    last_push = [0.0]
+
+    def ytdl_progress(d):
+        if d["status"] != "downloading": return
+        total    = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+        current  = d.get("downloaded_bytes", 0)
+        filename = os.path.basename(d.get("filename", "Video"))
+        speed    = d.get("speed") or 0
+        eta_s    = d.get("eta") or 0
+        progress = (current / total * 100) if total > 0 else 0
+        elapsed  = time.time() - task.start_time
+        task.dl.update({
+            "filename":   clean_filename(filename),
+            "progress":   progress,
+            "speed":      speed,
+            "downloaded": current,
+            "total":      total,
+            "elapsed":    elapsed,
+            "eta":        eta_s,
+            "peer_line":  "├ Engine → YT-DLP\n",
+        })
+        task.filename  = clean_filename(filename)
+        task.file_size = total
+        now = time.time()
+        if current > 0 and now - last_push[0] >= MIN_EDIT_GAP:
+            last_push[0] = now
+            asyncio.run_coroutine_threadsafe(push_dashboard_update(task.user_id), loop)
+
+    ydl_opts = {
+        "format":             format_id,
+        "outtmpl":            os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+        "quiet":              True,
+        "nocheckcertificate": True,
+        "cookiefile": os.path.join(os.path.dirname(os.path.abspath(file)), "cookies.txt") if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(file)), "cookies.txt")) else None,
+        "noplaylist":         True,
+        "progress_hooks":     [ytdl_progress],
+        "merge_output_format": "mkv", # Ensures smooth merging of Best Video + Best Audio
+    }
+
+    def _run():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            return str(ydl.prepare_filename(info))
+
+    raw_path = await loop.run_in_executor(executor, _run)
+    
+    # Extension fallback logic in case ffmpeg changes the final container format
+    base, _ = os.path.splitext(raw_path)
+    for ext in (".mkv", ".mp4", ".webm", ".m4a", ".mp3", ".opus", ""):
+        candidate = base + ext
+        if os.path.exists(candidate):
+            return candidate
+    return raw_path
+
+
+async def process_ytdl_task(message: Message, task: DownloadTask, url: str, format_id: str):
+    try:
+        await push_dashboard_update(task.user_id)
+        file_path = await download_ytdl(url, task, format_id)
+        if task.cancelled:
+            cleanup_files(task); active_downloads.pop(task.gid, None)
+            await push_dashboard_update(task.user_id); return
+        task.file_path = file_path
+        await upload_to_telegram(file_path, message, task=task)
+        cleanup_files(task); active_downloads.pop(task.gid, None)
+        await push_dashboard_update(task.user_id)
+    except Exception as e:
+        await message.reply_text(f"❌ YT-DLP Error: {str(e)}")
+        cleanup_files(task); active_downloads.pop(task.gid, None)
+        await push_dashboard_update(task.user_id)
+
+
+# 👉 NEW DIRECT LEECH COMMAND (Bypasses Menu, Downloads Best Quality)
+@app.on_message(filters.command(["ytdlleech"]))
+async def ytdl_direct_leech(client, m: Message):
+    if len(m.command) < 2: return await m.reply_text("❌ Send Link!\nUsage: /ytdlleech <URL>")
+    url = m.text.split(None, 1)[1]
+    msg = await m.reply_text("⏳ Starting YT-DLP Direct Leech (Best Quality)...")
+    
+    user_id    = m.from_user.id
+    user_label = get_user_label(m)
+    
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    await get_or_create_dashboard(user_id, m, user_label)
+    
+    pseudo_gid = f"ytdl_{m.id}_{int(time.time())}"
+    task = DownloadTask(pseudo_gid, user_id)
+    task.dl["peer_line"] = "├ Engine → YT-DLP\n"
+    active_downloads[pseudo_gid] = task
+    
+    # Force highest quality video + audio combined
+    f_id = "bestvideo+bestaudio/best"
+    
+    asyncio.create_task(process_ytdl_task(m, task, url, f_id))
+    try: await msg.delete() # Clean up the initial status message
+    except: pass
+
+
+# 👉 INTERACTIVE SELECTOR (Keep this if you want format selection sometimes)
+@app.on_message(filters.command(["ytdl", "yt"]))
+async def ytdl_selector(client, m: Message):
+    if len(m.command) < 2: return await m.reply_text("❌ Send Link!")
+    url = m.text.split(None, 1)[1]
+    msg = await m.reply_text("🔍 Fetching Formats...")
+    try:
+        loop = asyncio.get_event_loop()
+        def _run():
+            with yt_dlp.YoutubeDL({"quiet": True, "nocheckcertificate": True}) as ydl:
+                return ydl.extract_info(url, download=False)
+        info = await loop.run_in_executor(executor, _run)
+        formats = info.get("formats", [])
+        buttons = []
+        seen = set()
+        for f in formats:
+            h = f.get("height")
+            if h and h not in seen and f.get("ext") in ("mp4", "webm"):
+                buttons.append([InlineKeyboardButton(f"🎬 {h}p", callback_data=f"yt_vid|{h}|{m.id}")])
+                seen.add(h)
+        buttons.append([InlineKeyboardButton("🎵 MP3", callback_data=f"yt_aud|mp3|{m.id}")])
+        buttons.append([InlineKeyboardButton("✖️ Cancel", callback_data="close_help")])
+        ytdl_session[m.id] = {"url": url, "user_id": m.from_user.id, "message": m}
+        await msg.edit_text("Select Quality:", reply_markup=InlineKeyboardMarkup(buttons))
+    except Exception as e:
+        await msg.edit_text(f"❌ Error Fetching Info:\n{str(e)}")
+
+
+@app.on_callback_query(filters.regex(r"^yt_"))
+async def ytdl_cb(client, cq: CallbackQuery):
+    data = cq.data.split("|")
+    mode, quality, msg_id = data[0], data[1], int(data[2])
+    session = ytdl_session.get(msg_id)
+    if not session:
+        await safe_answer(cq, "❌ Expired", show_alert=True); return
+    await safe_answer(cq)
+
+    if mode == "yt_vid":
+        f_id  = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
+        label = f"{quality}p"
+    else:
+        f_id  = "bestaudio/best"
+        label = "MP3"
+
+    orig_msg   = session["message"]
+    user_id    = session["user_id"]
+    user_label = get_user_label(orig_msg)
+
+    await cq.message.edit_text(f"⏳ Starting Download: {label}...")
+
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    await get_or_create_dashboard(user_id, orig_msg, user_label)
+
+    pseudo_gid = f"ytdl_{msg_id}_{int(time.time())}"
+    task = DownloadTask(pseudo_gid, user_id)
+    task.dl["peer_line"] = "├ Engine → YT-DLP\n"
+    active_downloads[pseudo_gid] = task
+
+    asyncio.create_task(process_ytdl_task(orig_msg, task, session["url"], f_id))
+    ytdl_session.pop(msg_id, None)
 
 
 # ── Callback: no-op ───────────────────────────────────────────────────────────
