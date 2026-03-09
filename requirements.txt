@@ -8,3 +8,4 @@ uvloop
 motor
 curl-cffi
 aiofiles
+yt_dlp
