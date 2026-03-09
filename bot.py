@@ -22,7 +22,7 @@ from config import (
     DASHBOARD_REFRESH_INTERVAL, MIN_EDIT_GAP,
     WORKERS, MAX_CONCURRENT_TRANSMISSIONS,
     BT_OPTIONS, DIRECT_OPTIONS, TASKS_PER_PAGE,
-    MONGO_URL # Make sure to add this to your config.py
+    MONGO_URL
 )
 
 try:
@@ -43,12 +43,13 @@ executor = ThreadPoolExecutor(max_workers=4)
 # MongoDB Setup
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["leech_bot_db"]
-users_col = db["users"]
+settings_col = db["settings"]
 
 active_downloads = {}
 user_settings    = {}
 user_dashboards  = {}
 user_edit_queues = {}
+
 
 class DownloadTask:
     def __init__(self, gid: str, user_id: int, extract: bool = False):
@@ -615,9 +616,11 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
     as_video   = user_settings.get(user_id, {}).get("as_video", False)
     video_exts = (".mp4", ".mkv", ".avi", ".webm")
 
-    # Fetch User's Dump Channel
-    user_data = await users_col.find_one({"user_id": user_id})
-    dump_channel = user_data.get("dump_channel") if user_data else None
+    # Fetch the Global Dump Channel
+    global_settings = await settings_col.find_one({"_id": "global_dump"})
+    dump_channel = None
+    if global_settings and global_settings.get("enabled"):
+        dump_channel = global_settings.get("channel_id")
 
     try:
         if os.path.isfile(file_path):
@@ -659,7 +662,7 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
             else:
                 sent_msg = await message.reply_document(document=file_path, caption=fc, progress=_progress, disable_notification=True)
 
-            # Copy to Dump Channel if set
+            # Copy to Dump Channel if enabled
             if sent_msg and dump_channel:
                 try:
                     await sent_msg.copy(dump_channel)
@@ -714,7 +717,7 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
                 else:
                     sent_msg = await message.reply_document(document=fp, caption=cap, disable_notification=True)
 
-                # Copy to Dump Channel if set
+                # Copy to Dump Channel if enabled
                 if sent_msg and dump_channel:
                     try:
                         await sent_msg.copy(dump_channel)
@@ -806,18 +809,39 @@ async def process_task_execution(message: Message, task: DownloadTask, download,
 
 @app.on_message(filters.command(["setdump"]))
 async def set_dump_channel(client, message: Message):
-    if len(message.command) < 2:
-        return await message.reply_text("❌ **Usage:** `/setdump <channel_id>`\n*(Make sure the bot is an admin in the channel)*")
+    # Security check: Only allow the OWNER_ID to use this command
+    if message.from_user.id != OWNER_ID:
+        return await message.reply_text("❌ **Access Denied:** Only the bot owner can configure the dump channel.")
+
+    args = message.text.split()
+    if len(args) < 3:
+        return await message.reply_text("❌ **Usage:** `/setdump <channel_id> -on` or `/setdump <channel_id> -off`\n*(Make sure the bot is an admin in the channel)*")
     
     try:
-        channel_id = int(message.command[1])
+        channel_id = int(args[1])
+        flag = args[2].lower()
+
+        if flag not in ["-on", "-off"]:
+            return await message.reply_text("❌ **Invalid flag.** Use `-on` to enable or `-off` to disable.")
+
+        is_enabled = (flag == "-on")
+
         # Save to DB
-        await users_col.update_one(
-            {"user_id": message.from_user.id},
-            {"$set": {"dump_channel": channel_id}},
+        await settings_col.update_one(
+            {"_id": "global_dump"},
+            {"$set": {
+                "channel_id": channel_id,
+                "enabled": is_enabled
+            }},
             upsert=True
         )
-        await message.reply_text(f"✅ **Dump Channel saved successfully!**\nFiles will now be copied to `{channel_id}`.")
+        
+        state_msg = "🟢 **ENABLED**" if is_enabled else "🔴 **DISABLED**"
+        await message.reply_text(
+            f"✅ **Dump Channel Updated!**\n\n"
+            f"**Channel:** `{channel_id}`\n"
+            f"**Status:** {state_msg}"
+        )
     except ValueError:
         await message.reply_text("❌ **Invalid channel ID.** It must be an integer (e.g., `-100123456789`).")
     except Exception as e:
@@ -920,11 +944,11 @@ async def help_command(client, message: Message):
         "• `/ql <link1> <link2>` — Download multiple links at once\n"
         "• `/leech <link>` — Standard download\n"
         "• `/leech <link> -e` — Download & auto-extract archive\n"
-        "• `/setdump <channel_id>` — Set your personal dump channel\n"
         "• **Upload a `.torrent` file** directly to start\n\n"
         "**⚙️ Control:**\n"
         "• `/settings` — Toggle Document / Video upload mode\n"
-        "• `/stop <task_id>` — Cancel an active task\n\n"
+        "• `/stop <task_id>` — Cancel an active task\n"
+        "• `/setdump <channel_id> -on/-off` — Manage global dump channel (Owner Only)\n\n"
         "**✨ Features:**\n"
         "✓ Paginated dashboard — 4 tasks per page with ◀ Prev / Next ▶\n"
         "✓ ONE dashboard message per user, auto-refreshes every 15s\n"
