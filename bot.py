@@ -50,7 +50,7 @@ active_downloads = {}
 user_settings    = {}
 user_dashboards  = {}
 user_edit_queues = {}
-
+ytdl_session     = {}
 
 class DownloadTask:
     def __init__(self, gid: str, user_id: int, extract: bool = False):
