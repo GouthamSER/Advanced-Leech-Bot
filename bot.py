@@ -520,15 +520,20 @@ async def download_ytdl(url: str, task: DownloadTask, format_id: str) -> str:
     local_cookie_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
     
     ydl_opts = {
-        "format":             format_id,
-        "outtmpl":            os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
-        "quiet":              True,
-        "nocheckcertificate": True,
-        "cookiefile":         local_cookie_path if os.path.exists(local_cookie_path) else None,
-        "noplaylist":         True,
-        "progress_hooks":     [ytdl_progress],
-        "merge_output_format": "mkv",
-    }
+    "format":              format_id,
+    "outtmpl":             os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+    "quiet":               True,
+    "nocheckcertificate":  True,
+    "cookiefile":          local_cookie_path if os.path.exists(local_cookie_path) else None,
+    "noplaylist":          True,
+    "progress_hooks":      [ytdl_progress],
+    "merge_output_format": "mkv",
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["ios", "mweb", "web"],
+        }
+    },
+}
 
     def _run():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
