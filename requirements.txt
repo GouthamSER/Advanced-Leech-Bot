@@ -11,3 +11,4 @@ aiofiles
 yt_dlp
 ffmpeg
 nodejs
+deno
