@@ -12,6 +12,7 @@ RUN apt-get update -qq && \
     apt-get install -y -qq \
         aria2 \
         curl \
+        ffmpeg \
         wget \
         ca-certificates \
         netcat-openbsd \
