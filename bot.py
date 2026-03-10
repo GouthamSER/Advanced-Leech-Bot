@@ -1,6 +1,9 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
 
 import yt_dlp
-import re,os
+import re
 import time
 import asyncio
 import aria2p
