@@ -497,20 +497,27 @@ def _get_local_cookie_path() -> str | None:
 
 # Base ydl_opts shared between info-fetch and download
 def _base_ydl_opts(cookie_path: str | None) -> dict:
-    return {
+    # ios/android do NOT support cookies — use web clients when cookies exist,
+    # ios/android when they don't (they bypass n-challenge natively).
+    # skip_webpage removed — it breaks format discovery.
+    if cookie_path:
+        clients = ["web", "mweb"]
+    else:
+        clients = ["ios", "android"]
+
+    opts = {
         "quiet":              True,
         "nocheckcertificate": True,
-        "cookiefile":         cookie_path,
         "noplaylist":         True,
         "extractor_args": {
             "youtube": {
-                # ios bypasses n-challenge natively, android gives full format list,
-                # tv_embedded works reliably on server IPs without cookies.
-                # skip_webpage removed — it breaks format discovery.
-                "player_client": ["ios", "android", "tv_embedded"],
+                "player_client": clients,
             }
         },
     }
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+    return opts
 
 
 async def download_ytdl(url: str, task: DownloadTask, format_id: str, is_audio: bool = False) -> str:
@@ -619,6 +626,7 @@ async def ytleech_command(client, m: Message):
             opts = {
                 **_base_ydl_opts(cookie_path),
                 "skip_download": True,
+                "socket_timeout": 30,   # don't hang forever on bad URLs
             }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
@@ -673,7 +681,14 @@ async def ytleech_command(client, m: Message):
         ])
         buttons.append([InlineKeyboardButton("✖️ Cancel", callback_data="close_help")])
 
-        ytdl_session[m.id] = {"url": url, "user_id": m.from_user.id, "message": m}
+        session_key = f"{m.from_user.id}_{m.id}"
+        ytdl_session[session_key] = {"url": url, "user_id": m.from_user.id, "message": m}
+
+        # Auto-expire session after 5 minutes if user never picks a quality
+        async def _expire_session():
+            await asyncio.sleep(300)
+            ytdl_session.pop(session_key, None)
+        asyncio.create_task(_expire_session())
 
         await msg.edit_text(
             f"🎬 **{title}**\n\nSelect quality:",
@@ -691,7 +706,9 @@ async def ytleech_quality_callback(client, cq: CallbackQuery):
     mode   = parts[0]           # yl_vid  or  yl_aud
     msg_id = int(parts[-1])
 
-    session = ytdl_session.get(msg_id)
+    # Use composite key: user_id + msg_id to avoid collision across users
+    session_key = f"{cq.from_user.id}_{msg_id}"
+    session = ytdl_session.get(session_key)
     if not session:
         await safe_answer(cq, "❌ Session expired. Please send the link again.", show_alert=True)
         return
@@ -741,7 +758,7 @@ async def ytleech_quality_callback(client, cq: CallbackQuery):
     asyncio.create_task(
         process_ytdl_task(orig_msg, task, session["url"], f_id, is_audio=is_audio)
     )
-    ytdl_session.pop(msg_id, None)
+    ytdl_session.pop(session_key, None)
 
 
 # ── Callback: no-op ───────────────────────────────────────────────────────────
@@ -877,7 +894,7 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
     as_video   = user_settings.get(user_id, {}).get("as_video", False)
     video_exts = (".mp4", ".mkv", ".avi", ".webm")
 
-    # Fetch the Global Dump Channel
+    # Fetch dump channel once per upload call, not once per file in a directory
     global_settings = await settings_col.find_one({"_id": "global_dump"})
     dump_channel = None
     if global_settings and global_settings.get("enabled"):
@@ -1027,17 +1044,18 @@ async def process_task_execution(message: Message, task: DownloadTask, download,
             cleanup_files(task); active_downloads.pop(task.gid, None)
             await push_dashboard_update(task.user_id); return
 
-        if task.cancelled:
-            cleanup_files(task); active_downloads.pop(task.gid, None)
-            await push_dashboard_update(task.user_id); return
-
         try:
-            fdl = aria2.get_download(task.gid); fp = os.path.join(DOWNLOAD_DIR, fdl.name)
+            fdl = aria2.get_download(task.gid)
+            fp  = os.path.join(DOWNLOAD_DIR, fdl.name)
+            # For multi-file torrents aria2 creates a directory — use it directly
+            if not os.path.exists(fp):
+                fp = os.path.join(DOWNLOAD_DIR, task.dl["filename"])
         except Exception:
             fp = os.path.join(DOWNLOAD_DIR, task.dl["filename"])
         task.file_path = fp
 
-        if extract and fp.endswith((".zip", ".7z", ".tar.gz", ".tgz", ".tar")):
+        # Extract only makes sense on a single archive file, not a directory
+        if extract and os.path.isfile(fp) and fp.endswith((".zip", ".7z", ".tar.gz", ".tgz", ".tar")):
             if task.cancelled:
                 cleanup_files(task); active_downloads.pop(task.gid, None)
                 await push_dashboard_update(task.user_id); return
@@ -1238,6 +1256,10 @@ async def help_command(client, message: Message):
 
 @app.on_callback_query(filters.regex(r"^close_help$"))
 async def close_help_callback(client, cq: CallbackQuery):
+    # Clean up any dangling ytdl session for this user+message
+    msg_id = cq.message.reply_to_message.id if cq.message.reply_to_message else None
+    if msg_id:
+        ytdl_session.pop(f"{cq.from_user.id}_{msg_id}", None)
     try: await cq.message.delete()
     except Exception: pass
 
@@ -1269,8 +1291,15 @@ async def toggle_mode_callback(client, cq: CallbackQuery):
     if cq.from_user.id != uid:
         await safe_answer(cq, "❌ These aren't your settings!", show_alert=True); return
     cur = user_settings.get(uid, {}).get("as_video", False)
-    user_settings.setdefault(uid, {})["as_video"] = not cur
-    mt = "🎬 Video (Playable)" if not cur else "📄 Document (File)"
+    new_val = not cur
+    user_settings.setdefault(uid, {})["as_video"] = new_val
+    # Persist to MongoDB so it survives restarts
+    await settings_col.update_one(
+        {"_id": f"user_settings_{uid}"},
+        {"$set": {"as_video": new_val}},
+        upsert=True
+    )
+    mt = "🎬 Video (Playable)" if new_val else "📄 Document (File)"
     kb_buttons = [[InlineKeyboardButton(f"Toggle: {mt}", callback_data=f"toggle_mode:{uid}")]]
     if uid == OWNER_ID:
         cookie_doc = await settings_col.find_one({"_id": "ytdl_cookies"})
@@ -1343,6 +1372,14 @@ async def main():
             print("🗑 Cleared stale local cookies.")
 
     await app.start()
+
+    # Load persisted user settings (as_video toggle etc.) into memory
+    async for doc in settings_col.find({"_id": {"$regex": "^user_settings_"}}):
+        try:
+            uid = int(doc["_id"].replace("user_settings_", ""))
+            user_settings[uid] = {"as_video": doc.get("as_video", False)}
+        except Exception:
+            pass
 
     try:
         await app.send_message(OWNER_ID, "✅ **Bot Restarted Successfully!**")
