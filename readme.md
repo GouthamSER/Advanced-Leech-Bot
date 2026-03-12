@@ -153,7 +153,7 @@ CMD ["bash", "-c", "bash start.sh && python bot.py"]
 
 ### ☁️ Platform Deployment
 
-#### Render / Koyeb / Railway
+#### Koyeb 
 
 1. Set all environment variables in the platform dashboard
 2. Set **Start Command** to:
