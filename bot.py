@@ -44,6 +44,15 @@ app = Client(
 aria2    = aria2p.API(aria2p.Client(host=ARIA2_HOST, port=ARIA2_PORT, secret=ARIA2_SECRET))
 executor = ThreadPoolExecutor(max_workers=4)
 
+async def aria2_run(fn, *args, **kwargs):
+    """Run a synchronous aria2p call in the thread executor.
+    aria2p uses 'requests' under the hood — every aria2.get_download / add_uris /
+    add_torrent / remove is a real synchronous HTTP call that would otherwise
+    block the entire asyncio event loop for the duration of the RPC round-trip.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, lambda: fn(*args, **kwargs))
+
 # MongoDB Setup
 mongo_client = AsyncIOMotorClient(MONGO_URL)
 db = mongo_client["leech_bot_db"]
@@ -142,7 +151,10 @@ def format_time(s: float) -> str:
     return f"{s}s"
 
 def get_system_stats() -> dict:
-    cpu  = psutil.cpu_percent(interval=0.1)
+    # BUG FIX: cpu_percent(interval=0.1) sleeps for 100ms synchronously, blocking
+    # the entire async event loop on every dashboard render. interval=None returns
+    # the value from the last call immediately without any blocking sleep.
+    cpu  = psutil.cpu_percent(interval=None)
     ram  = psutil.virtual_memory()
     up   = time.time() - psutil.boot_time()
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -564,23 +576,31 @@ async def download_ytdl(url: str, task: DownloadTask, format_id: str, is_audio: 
     cookie_path = _get_local_cookie_path()
     ydl_opts = {
         **_base_ydl_opts(cookie_path),
-        "format":              format_id,
-        "outtmpl":             os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
-        "progress_hooks":      [ytdl_progress],
-        "merge_output_format": "mp4",   # mp4 container for video (widely supported)
+        "format":         format_id,
+        "outtmpl":        os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+        "progress_hooks": [ytdl_progress],
+        "socket_timeout": 30,   # Instagram/TikTok drop connections faster than YouTube
     }
+
+    # ── merge_output_format must ONLY be set when the format string requests
+    # separate video+audio tracks (contains "+"), e.g. "bestvideo+bestaudio".
+    # Setting it unconditionally causes FFmpegMergerPP to run on single-stream
+    # files (Instagram reels, TikTok, etc.) where there is nothing to merge.
+    # ffprobe then fails to find a separate audio codec and emits:
+    #   "WARNING: unable to obtain file audio codec with ffprobe"
+    # which can corrupt or produce a zero-byte output file.
+    if "+" in format_id:
+        ydl_opts["merge_output_format"] = "mp4"
 
     # ── MP3: use FFmpegExtractAudio postprocessor for a proper conversion ──
     if is_audio:
-        ydl_opts["format"]          = "bestaudio/best"
-        ydl_opts["outtmpl"]         = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
-        ydl_opts["postprocessors"]  = [{
+        ydl_opts["format"]         = "bestaudio/best"
+        ydl_opts["postprocessors"] = [{
             "key":              "FFmpegExtractAudio",
             "preferredcodec":   "mp3",
-            "preferredquality": "320",   # 320 kbps
+            "preferredquality": "320",
         }]
-        # Remove merge_output_format — irrelevant for audio-only
-        ydl_opts.pop("merge_output_format", None)
+        ydl_opts.pop("merge_output_format", None)  # irrelevant for audio-only
 
     def _run():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -792,7 +812,7 @@ async def poll_download_progress(task: DownloadTask):
     await asyncio.sleep(2)
     while not task.cancelled:
         try:
-            dl = aria2.get_download(task.gid)
+            dl = await aria2_run(aria2.get_download, task.gid)
             if dl.is_complete: break
             _eta = dl.eta
             raw_eta = _eta.total_seconds() if _eta and _eta.total_seconds() > 0 else 0
@@ -917,7 +937,15 @@ async def extract_archive(file_path: str, extract_to: str, task: DownloadTask = 
                 with tarfile.open(file_path, "r:*") as tf:
                     ms = tf.getmembers(); n = len(ms); tu = sum(m.size for m in ms); done = 0
                     for i, m in enumerate(ms, 1):
-                        tf.extract(m, extract_to); done += m.size
+                        # BUG FIX: tf.extract(member, path) is deprecated since Python 3.12
+                        # and has a path-traversal vulnerability. Use extractall with a
+                        # single-member list and the 'data' filter (safe, strips absolute paths).
+                        try:
+                            tf.extractall(path=extract_to, members=[m], filter="data")
+                        except TypeError:
+                            # Python < 3.12 does not support the filter= parameter
+                            tf.extract(m, extract_to)  # noqa: S202
+                        done += m.size
                         if i % 5 == 0 or i == n:
                             asyncio.run_coroutine_threadsafe(_update(done, tu, m.name, i, n), loop)
                 return True
@@ -1055,6 +1083,11 @@ async def upload_to_telegram(file_path: str, message: Message, caption: str = ""
     except Exception as e:
         await message.reply_text(f"❌ Upload error: {str(e)}")
         return False
+    # BUG FIX: if file_path is neither a file nor a directory (e.g. deleted between
+    # download and upload, or aria2 wrote to an unexpected location), the try block
+    # falls through without returning, giving the caller an implicit None (falsy but
+    # misleading). Return False explicitly so callers can detect the failure cleanly.
+    return False
 
 
 # ── Core task processor ───────────────────────────────────────────────────────
@@ -1067,7 +1100,7 @@ async def process_task_execution(message: Message, task: DownloadTask, download,
 
         while not task.cancelled:
             await asyncio.sleep(2)
-            try: cdl = aria2.get_download(task.gid)
+            try: cdl = await aria2_run(aria2.get_download, task.gid)
             except Exception: break
             fb = getattr(cdl, "followed_by", None)
             if fb:
@@ -1078,17 +1111,21 @@ async def process_task_execution(message: Message, task: DownloadTask, download,
             if cdl.is_complete: break
             elif getattr(cdl, "has_failed", False):
                 active_downloads.pop(task.gid, None)
+                task.cancelled = True   # BUG FIX: without this, poll_download_progress
+                                        # keeps looping and making dead RPC calls forever
                 await message.reply_text(f"❌ **Aria2 Error:** `{cdl.error_message}`")
                 cleanup_files(task); await push_dashboard_update(task.user_id); return
 
         if task.cancelled:
-            try: aria2.remove([aria2.get_download(task.gid)], force=True, files=True)
+            try:
+                _dl_to_remove = await aria2_run(aria2.get_download, task.gid)
+                await aria2_run(aria2.remove, [_dl_to_remove], force=True, files=True)
             except Exception: pass
             cleanup_files(task); active_downloads.pop(task.gid, None)
             await push_dashboard_update(task.user_id); return
 
         try:
-            fdl = aria2.get_download(task.gid)
+            fdl = await aria2_run(aria2.get_download, task.gid)
             fp  = os.path.join(DOWNLOAD_DIR, fdl.name)
             # For multi-file torrents aria2 creates a directory — use it directly.
             # BUG FIX: task.dl["filename"] is the cleaned display name and may not
@@ -1183,7 +1220,7 @@ async def universal_leech_command(client, message: Message):
         if doc.file_name.endswith(".torrent"):
             tp = os.path.join(DOWNLOAD_DIR, f"{message.id}_{doc.file_name}")
             await message.reply_to_message.download(file_name=tp)
-            dl = aria2.add_torrent(tp, options=BT_OPTIONS)
+            dl = await aria2_run(aria2.add_torrent, tp, options=BT_OPTIONS)
             task = DownloadTask(dl.gid, user_id, extract)
             asyncio.create_task(process_task_execution(message, task, dl, extract)); return
 
@@ -1195,7 +1232,7 @@ async def universal_leech_command(client, message: Message):
     for link in links:
         try:
             opts = BT_OPTIONS if link.startswith("magnet:") else {**BT_OPTIONS, **DIRECT_OPTIONS}
-            dl   = aria2.add_uris([link], options=opts)
+            dl   = await aria2_run(aria2.add_uris, [link], options=opts)
             task = DownloadTask(dl.gid, user_id, extract)
             asyncio.create_task(process_task_execution(message, task, dl, extract))
         except Exception as e:
@@ -1238,7 +1275,7 @@ async def handle_document_upload(client, message: Message):
             await get_or_create_dashboard(user_id, message, user_label)
             tp = os.path.join(DOWNLOAD_DIR, f"{message.id}_{file_name}")
             await message.download(file_name=tp)
-            dl = aria2.add_torrent(tp, options=BT_OPTIONS)
+            dl = await aria2_run(aria2.add_torrent, tp, options=BT_OPTIONS)
             task = DownloadTask(dl.gid, user_id, extract)
             asyncio.create_task(process_task_execution(message, task, dl, extract))
         except Exception as e:
@@ -1262,7 +1299,8 @@ async def stop_command(client, message: Message):
         found_task.cancelled = True
         try:
             if not found_task.gid.startswith("ytdl_"):
-                aria2.remove([aria2.get_download(found_task.gid)], force=True, files=True)
+                _dl_stop = await aria2_run(aria2.get_download, found_task.gid)
+                await aria2_run(aria2.remove, [_dl_stop], force=True, files=True)
             cleanup_files(found_task)
         except Exception as e: print(f"Stop error: {e}")
         active_downloads.pop(found_gid, None); active_downloads.pop(found_task.gid, None)
